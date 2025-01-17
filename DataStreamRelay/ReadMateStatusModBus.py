@@ -3,7 +3,9 @@ import time
 import logging
 import mysql.connector as mariadb
 from datetime import datetime
-from pymodbus.client.sync import ModbusTcpClient as ModbusClient
+#from pymodbus.client.sync import ModbusTcpClient as ModbusClient
+from pymodbus.client import ModbusTcpClient as ModbusClient
+#from pymodbus.client import ModbusTcpClient
 from pymodbus.constants import Endian
 from pymodbus.payload import BinaryPayloadDecoder
 from configparser import ConfigParser
@@ -11,7 +13,7 @@ import paho.mqtt.publish as publish
 import shutil  
 import sys, os
 
-script_ver = "0.7.2_20230220"
+script_ver = "0.9.2_20241124"
 print ("script version: "+ script_ver)
 
 pathname          = os.path.dirname(sys.argv[0])        
@@ -38,26 +40,8 @@ duplicate_active  = config.get('Path', 'duplicate_active')
 duplicate_path    = config.get('Path', 'duplicate_path')
 
 # MQTT 
-MQTT_active                     = config.get('MQTT', 'MQTT_active')
-MQTT_broker                     = config.get('MQTT', 'MQTT_broker')
-MQTT_master_ac_input_voltage    = config.get('MQTT','MQTT_master_ac_input_voltage')
-MQTT_master_output_ac_voltage   = config.get('MQTT','MQTT_master_output_ac_voltage')
-MQTT_master_ac_use              = config.get('MQTT','MQTT_master_ac_use')
-MQTT_master_operating_modes     = config.get('MQTT','MQTT_master_operating_modes')
-MQTT_master_grid_input_mode     = config.get('MQTT','MQTT_master_grid_input_mode')
-MQTT_master_charger_mode        = config.get('MQTT','MQTT_master_charger_mode')
-MQTT_controller_1_cc_mode       = config.get('MQTT','MQTT_controller_1_cc_mode')
-MQTT_fndc_battery_voltage       = config.get('MQTT','MQTT_fndc_battery_voltage')
-MQTT_fndc_state_of_charge       = config.get('MQTT','MQTT_fndc_state_of_charge')
-MQTT_fndc_battery_temperature   = config.get('MQTT','MQTT_fndc_battery_temperature')
-MQTT_fndc_shunt_c_current       = config.get('MQTT','MQTT_fndc_shunt_c_current')
-MQTT_fndc_shunt_b_current       = config.get('MQTT','MQTT_fndc_shunt_b_current')
-MQTT_fndc_charge_params_met     = config.get('MQTT','MQTT_fndc_charge_params_met')
-MQTT_fndc_days_since_charge_met = config.get('MQTT','MQTT_fndc_days_since_charge_met')
-MQTT_fndc_todays_net_input_kWh  = config.get('MQTT','MQTT_fndc_todays_net_input_kWh')
-MQTT_fndc_todays_net_output_kWh = config.get('MQTT','MQTT_fndc_todays_net_output_kWh')
-MQTT_summary_cc_total_watts     = config.get('MQTT','MQTT_summary_cc_total_watts') 
-MQTT_all_data                   = config.get('MQTT','MQTT_all_data')
+MQTT_active       = config.get('MQTT', 'MQTT_active')
+MQTT_broker       = config.get('MQTT', 'MQTT_broker')
 
 debug             = config.get('General', 'debug')
 
@@ -77,10 +61,10 @@ date_str         = now.strftime("%Y-%m-%dT%H:%M:%S")
 date_sql         = datetime.now().replace(second=0, microsecond=0)
 
 device_list=[          #used in main loop      
-    "VFXR3048_master", #port 1   used for MQTT data
-    "VFXR3048_slave",  #port 2
-    "FM60",            #port 3
-    "FM80",            #port 4
+    "VFXR3048_01",     #port 1   used for MQTT data
+    "FM60",            #port 2
+    "FM80",            #port 3
+    "VFXR3048_02",     #port 4
     "FNDC"             #port 5   used for MQTT data
     ]
 
@@ -152,8 +136,8 @@ def get_common_block(basereg):
     length   = 69
     response = client.read_holding_registers(basereg, length + 2)
     decoder  = BinaryPayloadDecoder.fromRegisters(response.registers,
-                                                 byteorder=Endian.Big,
-                                                 wordorder=Endian.Big)
+                                                 byteorder=Endian.BIG,
+                                                 wordorder=Endian.BIG)
     return {
         'SunSpec_ID': decoder.decode_32bit_uint(),
         'SunSpec_DID': decoder.decode_16bit_uint(),
@@ -184,8 +168,8 @@ def getSunSpec(basereg):
     # There is a 16 bit string at basereg + 4 that contains Manufacturer
     response = client.read_holding_registers(basereg + 4, 16)
     decoder  = BinaryPayloadDecoder.fromRegisters(response.registers,
-                                                 byteorder=Endian.Big,
-                                                 wordorder=Endian.Big)
+                                                 byteorder=Endian.BIG,
+                                                 wordorder=Endian.BIG)
     manufacturer = decoder.decode_string(16)
     
     if "OUTBACK_POWER" in str(manufacturer.upper()):
@@ -246,15 +230,18 @@ start_run  = datetime.now() # used only for runtime calculation
 # Mate3 connection
 try:
     client = ModbusClient(mate3_ip, mate3_modbus)
+    client.connect()
+
     logging.info(".. Make sure we are indeed connected to an Outback power system")
     reg    = sunspec_start_reg
     size   = getSunSpec(reg)
     if size is None:
         logging.info("We have failed to detect an Outback system. Exciting")
         exit()
-except:
+except Exception as e:
     client.close()
-    ErrorPrint("Error: RMS - Fail to connect to MATE")
+
+    ErrorPrint("Error: RMS - Fail to connect to MATE " + str(e))
     logging.info(".. Failed to connect to MATE3. Enable SUNSPEC and check port. Exciting")
     exit()
 logging.info(".. Connected OK to an Outback system")
@@ -262,20 +249,24 @@ logging.info(".. Connected OK to an Outback system")
 #This is the main loop
 #--------------------------------------------------------------
 
-devices           = []                           # used for JSON file - list of data for all devices
-various           = []                           # used for JSON file - different data not connected with MateMonitoring project
-db_devices_values = []                           # used for MariaDB upload - list of all data for all devices  
-db_devices_sql    = []                           # used for MariaDB upload - list of all data for all devices 
-mqtt_devices      = []                           # used for MQTT - list with topics and payloads 
-CC_total_watts    = 0                            # used for MQTT to sum the total pv power from charge controlers
+devices            = []                           # used for JSON file - list of data for all devices
+various            = []                           # used for JSON file - different data not connected with MateMonitoring project
+db_devices_values  = []                           # used for MariaDB upload - list of all data for all devices  
+db_devices_sql     = []                           # used for MariaDB upload - list of all data for all devices 
+mqtt_devices       = []                           # used for MQTT - list with topics and payloads 
+CC_total_watts     = 0                            # used for MQTT to sum the pv power from charge controlers
+CC_total_daily_kwh = 0                            # used for MQTT to sum the daily pv power from charge controlers  
 
 startReg = reg + size + 4
+
 while True:
     time={                                         # used for JSON file - servertime now
     "relay_local_time": date_str,
     "mate_local_time": date_str,
     "server_local_time": date_str}
 
+    inverters=0                                    # used to count number of inverters detected
+    chargers =0                                    # used to count number of chargers detected
     reg = startReg
     for block in range(0, 30):
         blockResult = getBlock(reg)
@@ -283,6 +274,7 @@ while True:
         try:        
             if "Single Phase Radian Inverter Real Time Block" in blockResult['DID']:
                 logging.info(".. Detected a Single Phase Radian Inverter Real Time Block" + " -Registry:"+str(reg))
+                inverters = inverters + 1
                 response = client.read_holding_registers(reg + 2, 1)
                 port=(response.registers[0]-1)
                 address=port+1
@@ -357,8 +349,20 @@ while True:
                 response = client.read_holding_registers(reg + 19, 1)
                 GS_Single_AUX_Relay_Output_State = int(response.registers[0])
                 logging.info(".... FXR Aux Relay state  " + str(GS_Single_AUX_Relay_Output_State))
-                aux_relay_list=["Aux:disabled","Aux:enabled"]
+                aux_relay_list=["disabled","enabled"]
                 aux_relay=aux_relay_list[GS_Single_AUX_Relay_Output_State]
+
+                response = client.read_holding_registers(reg + 21, 1)
+                GS_Single_L_Module_Transformer_Temperature = int(response.registers[0])
+                logging.info(".... FXR L Transformer Temperature  " + str(GS_Single_L_Module_Transformer_Temperature))
+                
+                response = client.read_holding_registers(reg + 22, 1)
+                GS_Single_L_Module_Capacitor_Temperature = int(response.registers[0])
+                logging.info(".... FXR L Capacitor Temperature  " + str(GS_Single_L_Module_Capacitor_Temperature))
+                
+                response = client.read_holding_registers(reg + 23, 1)
+                GS_Single_L_Module_FET_Temperature = int(response.registers[0])
+                logging.info(".... FXR L FET Temperature  " + str(GS_Single_L_Module_FET_Temperature))                  
 
                 response = client.read_holding_registers(reg + 27, 1)
                 gs_single_battery_temperature = decode_int16(int(response.registers[0]))
@@ -368,6 +372,7 @@ while True:
                 GS_Split_Error_Flags = int(response.registers[0])
                 logging.info(".... FXR Error Flags " + str(GS_Split_Error_Flags))
                 error_flags='None'
+                if GS_Split_Error_Flags == 0:   error_flags='Nothing'                
                 if GS_Split_Error_Flags == 1:   error_flags='Low AC output voltage'
                 if GS_Split_Error_Flags == 2:   error_flags='Stacking error'               
                 if GS_Split_Error_Flags == 4:   error_flags='Over temperature error'
@@ -381,6 +386,7 @@ while True:
                 GS_Single_Warning_Flags = int(response.registers[0])
                 logging.info(".... FXR Warning Flags " + str(GS_Single_Warning_Flags))
                 warning_flags='None'
+                if GS_Single_Warning_Flags == 0:   warning_flags='Nothing'                
                 if GS_Single_Warning_Flags == 1:   warning_flags='AC input frequency too high'
                 if GS_Single_Warning_Flags == 2:   warning_flags='AC input frequency too low'               
                 if GS_Single_Warning_Flags == 4:   warning_flags='AC input voltage too low'
@@ -401,12 +407,15 @@ while True:
                   "ac_output_voltage": gs_single_output_ac_voltage,
                   "sell_current": GS_Single_Inverter_Sell_Current,
                   "operational_mode": operating_modes,
+                  "transformator_temperature": GS_Single_L_Module_Transformer_Temperature,
+                  "capacitors_temperature": GS_Single_L_Module_Capacitor_Temperature,
+                  "fet_temperature": GS_Single_L_Module_FET_Temperature,
                   "error_modes": [
                     error_flags
                   ],
                   "ac_mode": ac_use,
                   "battery_voltage":gs_single_battery_voltage,
-                  "misc":aux_relay,
+                  "aux_relay":aux_relay,
                   "warning_modes": [
                     warning_flags
                   ],
@@ -424,12 +433,24 @@ while True:
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
 
                 # FXR data - MQTT preparation   
-                if device_list[port]=='VFXR3048_master' :                     # master invertor 
-                    mqtt_devices.append(
-                                {MQTT_master_ac_input_voltage        :gs_single_ac_input_voltage,
-                                 MQTT_master_output_ac_voltage       :gs_single_output_ac_voltage,
-                                 MQTT_master_ac_use         :ac_use,
-                                 MQTT_master_operating_modes:operating_modes})
+                mqtt_devices.append({
+                             "outback/inverters/" + str(inverters) + "/inverter_current":gs_single_inverter_output_current,
+                             "outback/inverters/" + str(inverters) + "/charge_current"  :gs_single_inverter_charge_current,
+                             "outback/inverters/" + str(inverters) + "/buy_current"     :gs_single_inverter_buy_current,
+                             "outback/inverters/" + str(inverters) + "/sell_current"    :GS_Single_Inverter_Sell_Current,
+                             "outback/inverters/" + str(inverters) + "/battery_voltage" :gs_single_battery_voltage,
+                             "outback/inverters/" + str(inverters) + "/battery_voltage_compensated" :gs_single_temp_compensated_target_voltage,
+                             "outback/inverters/" + str(inverters) + "/ac_input"        :gs_single_ac_input_voltage,
+                             "outback/inverters/" + str(inverters) + "/ac_output"       :gs_single_output_ac_voltage,
+                             "outback/inverters/" + str(inverters) + "/ac_use"          :ac_use,
+                             "outback/inverters/" + str(inverters) + "/operating_modes" :operating_modes,
+                             "outback/inverters/" + str(inverters) + "/aux_relay"       :aux_relay,
+                             "outback/inverters/" + str(inverters) + "/error_flags"     :error_flags,
+                             "outback/inverters/" + str(inverters) + "/warning_modes"   :warning_flags,
+                             "outback/inverters/" + str(inverters) + "/trafo_temp"      :GS_Single_L_Module_Transformer_Temperature,
+                             "outback/inverters/" + str(inverters) + "/capacitor_temp"  :GS_Single_L_Module_Capacitor_Temperature,
+                             "outback/inverters/" + str(inverters) + "/fet_temp"        :GS_Single_L_Module_FET_Temperature
+                             })
       
         except Exception as e:
             ErrorPrint("Error: RMS - port: " + str(port) + " FXR module " + str(e))
@@ -467,10 +488,9 @@ while True:
                 devices[address-1]["charger_mode"] = charger_mode
                 
                 # FXR dataconfig - Mqtt preparation
-                if device_list[port]=='VFXR3048_master':
-                    mqtt_devices.append(
-                        {MQTT_master_grid_input_mode:grid_input_mode,
-                         MQTT_master_charger_mode:charger_mode})
+                mqtt_devices.append(
+                        {"outback/inverters/" + str(inverters) + "/grid_input_mode":grid_input_mode,
+                         "outback/inverters/" + str(inverters) + "/charger_mode"   :charger_mode})
      
         except Exception as e:
             ErrorPrint("Error: RMS - port: " + str(port) + " FXR config block " + str(e))
@@ -478,6 +498,7 @@ while True:
         try:
             if "Charge Controller Block" in blockResult['DID']:
                 logging.info(".. Detected a Charge Controller Block")
+                chargers = chargers +1
 
                 response = client.read_holding_registers(reg + 2, 1)
                 logging.info(".... Connected on HUB port " + str(response.registers[0]))
@@ -499,7 +520,8 @@ while True:
                 response = client.read_holding_registers(reg + 18, 1)
                 CC_Todays_KW = round(int(response.registers[0]) * 0.1,2)
                 logging.info(".... CC Daily_KW (KW) " + str(CC_Todays_KW))
-
+                CC_total_daily_kwh = CC_total_daily_kwh + CC_Todays_KW
+                
                 response = client.read_holding_registers(reg + 13, 1)
                 CC_Watts = round(int(response.registers[0]),2)
                 logging.info(".... CC Actual_watts (W) " + str(CC_Watts))
@@ -518,7 +540,7 @@ while True:
                 response = client.read_holding_registers(reg + 19, 1)
                 CC_Todays_AH = round(int(response.registers[0]),2)
                 logging.info(".... CC Daily_AH (A) " + str(CC_Todays_AH))
-                
+          
             if "Charge Controller Configuration block" in blockResult['DID']:           #some CC parameters are in configuration block
                 logging.info(".. Charge Controller Configuration block")
                 response = client.read_holding_registers(reg + 2, 1)
@@ -546,6 +568,7 @@ while True:
                 CCconfig_Faults = int(response.registers[0])
                 logging.info(".... CC Error Flags " + str(CCconfig_Faults))
                 error_flags='None'            
+                if CCconfig_Faults == 0:   error_flags='Nothing' 
                 if CCconfig_Faults == 16:  error_flags='Fault Input Active'                
                 if CCconfig_Faults == 32:  error_flags='Shorted Battery Temp Sensor'
                 if CCconfig_Faults == 64:  error_flags='Over Temp'               
@@ -558,7 +581,7 @@ while True:
                   "charge_current": cc_batt_current,
                   "pv_current": cc_array_current,
                   "pv_voltage": cc_array_voltage,
-                  "daily_kwh": CC_Todays_KW,
+                  "pv_watts": CC_Watts,
                   "aux": aux_mode,
                   "aux_mode": aux_state,
                   "error_modes": [
@@ -567,6 +590,7 @@ while True:
                   "charge_mode": cc_mode,
                   "battery_voltage": cc_batt_voltage,
                   "daily_ah": CC_Todays_AH,
+                  "daily_kwh": CC_Todays_KW,
                   "label": device_list[port]
                     }
                 devices.append(devices_array)
@@ -578,8 +602,19 @@ while True:
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
                 
                 #controlers data - MQTT data preparation
-                if device_list[port]=='FM80':
-                    mqtt_devices.append({MQTT_controller_1_cc_mode:cc_mode})                 
+                mqtt_devices.append({
+                    "outback/chargers/" + str(chargers) + "/charge_current" :cc_batt_current,
+                    "outback/chargers/" + str(chargers) + "/pv_current"     :cc_array_current,
+                    "outback/chargers/" + str(chargers) + "/pv_voltage"     :cc_array_voltage,
+                    "outback/chargers/" + str(chargers) + "/pv_watts"       :CC_Watts,
+                    "outback/chargers/" + str(chargers) + "/aux"            :aux_mode,
+                    "outback/chargers/" + str(chargers) + "/aux_mode"       :aux_state,
+                    "outback/chargers/" + str(chargers) + "/error_modes"    :error_flags,
+                    "outback/chargers/" + str(chargers) + "/battery_voltage":cc_batt_voltage,
+                    "outback/chargers/" + str(chargers) + "/daily_ah"       :CC_Todays_AH,
+                    "outback/chargers/" + str(chargers) + "/daily_kwh"      :CC_Todays_KW,
+                    "outback/chargers/" + str(chargers) + "/charge_mode"    :cc_mode
+                    })                 
         
         except Exception as e:
             ErrorPrint("Error: RMS - port: " + str(port) + " CC module " + str(e))
@@ -693,10 +728,14 @@ while True:
                 FN_Charge_Factor_Corrected_NET_Battery_kWh = round(decode_int16(int(response.registers[0])) * 0.01,2)
                 logging.info(".... FN_Charge_Factor_Corrected_NET_Battery_kWh " + str(FN_Charge_Factor_Corrected_NET_Battery_kWh))
                 
-                response = client.read_holding_registers(reg + 26, 1)
-                FN_Days_Since_Charge_Parameters_Met = round(int(response.registers[0]) * 0.1,2)
-                logging.info(".... FN_Days_Since_Charge_Parameters_Met " + str(FN_Days_Since_Charge_Parameters_Met))
+                response = client.read_holding_registers(reg + 38, 1)
+                FN_Todays_Minimum_Battery_Voltage = round(decode_int16(int(response.registers[0])) * 0.1 ,2)
+                logging.info(".... FN_Todays_Minimum_Battery_Voltage " + str(FN_Todays_Minimum_Battery_Voltage))                
                 
+                response = client.read_holding_registers(reg + 41, 1)
+                FN_Todays_Maximum_Battery_Voltage = round(decode_int16(int(response.registers[0])) * 0.1 ,2)
+                logging.info(".... FN_Todays_Maximum_Battery_Voltage " + str(FN_Todays_Maximum_Battery_Voltage))                
+
             if "FLEXnet-DC Configuration Block" in blockResult['DID']:
                 logging.info(".. Detect a FLEXnet-DC Configuration Block")
 
@@ -824,16 +863,21 @@ while True:
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)")
                     
                 # FNDC data - MQTT data preparation topic:value
-                mqtt_devices.append (
-                    {MQTT_fndc_battery_voltage:fn_battery_voltage,
-                     MQTT_fndc_state_of_charge:fn_state_of_charge,
-                     MQTT_fndc_battery_temperature:fn_battery_temperature,
-                     MQTT_fndc_shunt_c_current:fn_shunt_c_current,
-                     MQTT_fndc_shunt_b_current:fn_shunt_b_current,
-                     MQTT_fndc_charge_params_met:charge_params_met,
-                     MQTT_fndc_days_since_charge_met:FN_Days_Since_Charge_Parameters_Met,
-                     MQTT_fndc_todays_net_input_kWh:FN_Todays_NET_Input_kWh,
-                     MQTT_fndc_todays_net_output_kWh:FN_Todays_NET_Output_kWh})
+                mqtt_devices.append ({
+                     "outback/fndc/battery_voltage"      :fn_battery_voltage,
+                     "outback/fndc/state_of_charge"      :fn_state_of_charge,
+                     "outback/fndc/battery_temperature"  :fn_battery_temperature,
+                     "outback/fndc/shunt_a_current"      :fn_shunt_a_current,
+                     "outback/fndc/shunt_c_current"      :fn_shunt_c_current,
+                     "outback/fndc/shunt_b_current"      :fn_shunt_b_current,
+                     "outback/fndc/charge_params_met"    :charge_params_met,
+                     "outback/fndc/today_min_soc"        :FN_Todays_Minimum_SOC,
+                     "outback/fndc/days_since_charge_met":FN_Days_Since_Charge_Parameters_Met,
+                     "outback/fndc/today_net_input_ah"   :FN_Todays_NET_Input_AH,
+                     "outback/fndc/today_net_output_ah"  :FN_Todays_NET_Output_AH,
+                     "outback/fndc/todays_net_input_kWh" :FN_Todays_NET_Input_kWh,
+                     "outback/fndc/todays_net_output_kWh":FN_Todays_NET_Output_kWh
+                     })
 
         except Exception as e:
             ErrorPrint("Error: RMS - port: " + str(port) + " FNDC module " + str(e))
@@ -850,9 +894,7 @@ while True:
             break
   
     # MariaDB upload
-    min_bat_temp = None 
-    max_bat_temp = None
-    max_pv_voltage = None    
+    mariadb_run = datetime.now() 
     try:
         if SQL_active=='true':
             
@@ -867,67 +909,26 @@ while True:
                 n = n+1
             
             # summary of the day calculation for MariaDB upload
-            sql="SELECT min(battery_temp) from monitormate_fndc where date(date)= DATE(NOW())" #calculate min temp of the day
-            mycursor = mydb.cursor()
-            mycursor.execute(sql)
-            myresult = mycursor.fetchall()
-            min_bat_temp = myresult[0]
-            
-            for x in myresult:
-                min_bat_temp=x[0]
-            
-            sql="SELECT max(battery_temp) from monitormate_fndc where date(date)= DATE(NOW())" #calculate max temp of the day
-            mycursor = mydb.cursor()
-            mycursor.execute(sql)
-            myresult = mycursor.fetchall()
-            max_bat_temp = myresult[0]
-            
-            for x in myresult:
-                max_bat_temp=x[0]
-            
-            sql="SELECT max(pv_voltage) from monitormate_cc where date(date)= DATE(NOW())" #calculate max pv voltage of the day
-            
-            mycursor = mydb.cursor()
-            mycursor.execute(sql)
-            myresult = mycursor.fetchall()
-            max_pv_voltage = myresult[0]            
-            
-            for x in myresult:
-                max_pv_voltage=int(x[0])
-                
-            sql="SELECT min(charge_factor_corrected_net_batt_ah), min(charge_factor_corrected_net_batt_kwh) FROM monitormate_fndc WHERE date(date) = DATE(NOW())"    
-
-            mycursor = mydb.cursor()
-            mycursor.execute(sql)
-            myresult = mycursor.fetchall()
-            
-            for x in myresult:
-                out_batt_ah  = 0
-                out_batt_kwh = 0
-                if x[0] is not None: out_batt_ah  = x[0]    
-                if x[1] is not None: out_batt_kwh = x[1]            
-            
-            sql="SELECT date,kwh_in,kwh_out,ah_in,max_temp,min_temp,max_soc,min_soc,max_pv_voltage FROM monitormate_summary \
+            sql="SELECT date,kwh_in,kwh_out,ah_in,max_soc,min_soc FROM monitormate_summary \
             where date(date)= DATE(NOW())"
             
             mycursor = mydb.cursor()
             mycursor.execute(sql)
             myresult = mycursor.fetchall()
-            
+
             if not myresult:                                                               # check if any records for today - if not, record for the first time
-                val=(date_now,FN_Todays_NET_Input_kWh,FN_Todays_NET_Output_kWh,FN_Todays_NET_Input_AH,FN_Todays_NET_Output_AH,out_batt_ah,out_batt_kwh,
-                     max_bat_temp,min_bat_temp,FN_Todays_Maximum_SOC,FN_Todays_Minimum_SOC,max_pv_voltage)
-                sql="INSERT INTO monitormate_summary (date,kwh_in,kwh_out,ah_in,ah_out,out_batt_ah,out_batt_kwh,max_temp,min_temp,max_soc,min_soc,max_pv_voltage)\
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                val=(date_now,FN_Todays_NET_Input_kWh,FN_Todays_NET_Output_kWh,FN_Todays_NET_Input_AH,FN_Todays_NET_Output_AH,FN_Todays_Maximum_SOC,FN_Todays_Minimum_SOC)
+                sql="INSERT INTO monitormate_summary (date,kwh_in,kwh_out,ah_in,ah_out,max_soc,min_soc)\
+                VALUES (%s,%s,%s,%s,%s,%s,%s)"
                 mycursor = mydb.cursor()
                 mycursor.execute(sql, val)
                 mydb.commit()
                 logging.info(" Summary of the day - first record completed")
             else:                                                                           # if records - update table
-                val=(FN_Todays_NET_Input_kWh,FN_Todays_NET_Output_kWh,FN_Todays_NET_Input_AH,FN_Todays_NET_Output_AH,out_batt_ah,out_batt_kwh,
-                     max_bat_temp,min_bat_temp,FN_Todays_Maximum_SOC,FN_Todays_Minimum_SOC,max_pv_voltage,date_now)
-                sql="UPDATE monitormate_summary SET kwh_in=%s,kwh_out=%s,ah_in=%s,ah_out=%s,out_batt_ah=%s,out_batt_kwh=%s,max_temp=%s,min_temp=%s,\
-                max_soc=%s,min_soc=%s,max_pv_voltage=%s WHERE date=%s"
+                val=(FN_Todays_NET_Input_kWh,FN_Todays_NET_Output_kWh,FN_Todays_NET_Input_AH,FN_Todays_NET_Output_AH,
+                     FN_Todays_Maximum_SOC,FN_Todays_Minimum_SOC,date_now)
+                sql="UPDATE monitormate_summary SET kwh_in=%s,kwh_out=%s,ah_in=%s,ah_out=%s,\
+                max_soc=%s,min_soc=%s WHERE date=%s"
                 mycursor = mydb.cursor()
                 mycursor.execute(sql, val)
                 mydb.commit()
@@ -952,15 +953,18 @@ while True:
         "kwh_out": FN_Todays_NET_Output_kWh,
         "ah_in": FN_Todays_NET_Input_AH,
         "ah_out": FN_Todays_NET_Output_AH,
-        "max_temp": max_bat_temp,
-        "min_temp": min_bat_temp,
+        "min_voltage": FN_Todays_Minimum_Battery_Voltage,        
+        "max_voltage": FN_Todays_Maximum_Battery_Voltage,
         "min_soc": FN_Todays_Minimum_SOC,
         "max_soc": FN_Todays_Maximum_SOC,
-        "max_pv_voltage": max_pv_voltage,
-        "pv_watts": CC_total_watts }
+        "pv_watts": CC_total_watts,
+        "pv_daily_Kwh":CC_total_daily_kwh}
 
     # summary values - send data via MQTT 
-    mqtt_devices.append ({MQTT_summary_cc_total_watts:CC_total_watts})
+    mqtt_devices.append ({
+        "outback/summary/cc_total_watts":CC_total_watts,
+        "outback/summary/pv_daily_Kwh"  :CC_total_daily_kwh
+        })
    
     #JSON serialisation and save
     try:
@@ -986,7 +990,7 @@ while True:
                     #print(topic + ": " + str(mqtt_data[topic]))                    #DPO debug
                     
         ## send overall json data via MQTT                                                  
-        state_topic = MQTT_all_data                                    
+        state_topic = "outback/mate"                                   
         message     = json.dumps(json_data)                                         
         publish.single(state_topic, message, hostname=MQTT_broker)                    
 
